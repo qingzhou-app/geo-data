@@ -1,0 +1,89 @@
+name: Sync geo data
+
+on:
+  schedule:
+    - cron: "0 2 * * 0" # 每周日 02:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-geo-data
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch upstream release tags
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          geoip_tag=$(gh release view --repo v2fly/geoip --json tagName --jq .tagName)
+          geosite_tag=$(gh release view --repo v2fly/domain-list-community --json tagName --jq .tagName)
+          echo "geoip_tag=$geoip_tag" >> "$GITHUB_OUTPUT"
+          echo "geosite_tag=$geosite_tag" >> "$GITHUB_OUTPUT"
+          echo "Upstream: v2fly/geoip=$geoip_tag v2fly/domain-list-community=$geosite_tag"
+
+      - name: Download and verify against official sha256
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist && cd dist
+          gh release download "${{ steps.upstream.outputs.geoip_tag }}" --repo v2fly/geoip \
+            --pattern 'geoip.dat' --pattern 'geoip.dat.sha256sum' \
+            --pattern 'geoip-only-cn-private.dat' --pattern 'geoip-only-cn-private.dat.sha256sum'
+          gh release download "${{ steps.upstream.outputs.geosite_tag }}" --repo v2fly/domain-list-community \
+            --pattern 'dlc.dat' --pattern 'dlc.dat.sha256sum'
+          # 官方校验和逐个核对，任何一个失败整次同步失败、不发布
+          sha256sum -c geoip.dat.sha256sum
+          sha256sum -c geoip-only-cn-private.dat.sha256sum
+          sha256sum -c dlc.dat.sha256sum
+          # 上游资产名 dlc.dat → 发布名 geosite.dat，改名后重新生成校验和
+          mv dlc.dat geosite.dat
+          rm dlc.dat.sha256sum
+          sha256sum geosite.dat > geosite.dat.sha256sum
+          ls -l
+
+      - name: Publish release (tag = date)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=$(date -u +%Y%m%d)
+          notes="Upstream: v2fly/geoip ${{ steps.upstream.outputs.geoip_tag }}, v2fly/domain-list-community ${{ steps.upstream.outputs.geosite_tag }}. All files verified against official sha256sum before publishing."
+          # 同日重跑：先删旧 release + tag 再重建
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+          gh release create "$tag" \
+            dist/geoip.dat dist/geoip.dat.sha256sum \
+            dist/geoip-only-cn-private.dat dist/geoip-only-cn-private.dat.sha256sum \
+            dist/geosite.dat dist/geosite.dat.sha256sum \
+            --repo "$GITHUB_REPOSITORY" --title "$tag" --notes "$notes" --latest
+
+      - name: Heartbeat commit (防 60 天定时任务停用)
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .heartbeat
+          git add .heartbeat
+          git commit -m "heartbeat: $(date -u +%Y-%m-%d)"
+          git push
+
+      - name: Open issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "geo sync failed: $(date -u +%Y-%m-%d)" \
+            --body "自动同步 v2fly geo 数据失败，本次未发布 release（App 主源仍指向上一期，备源不受影响）。请查看运行日志：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
